@@ -1,86 +1,82 @@
-"""VCF Encoding Module for SecureGenomics Protocol."""
+"""VCF Encoding Module for SecureGenomics Protocol - Alzheimer's Disease Allele Frequency Analysis."""
 
-import gzip
-from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, TextIO
+import pysam
 
-# Target variants for breast cancer allele frequency analysis
+# Target variants for Alzheimer's disease sensitive allele frequency analysis
+# These are the most clinically significant and population-variable SNPs for AD research
 TARGET_VARIANTS = [
-    {"chr": "17", "pos": 43044295, "ref": "G", "alt": "A", "gene": "BRCA1", "variant_id": "rs80357382"},
-    {"chr": "13", "pos": 32315086, "ref": "T", "alt": "C", "gene": "BRCA2", "variant_id": "rs80359550"}
+    # Primary APOE variants (most critical for AD risk)
+    "rs429358",    # APOE ε4 defining SNP - 3-12x increased AD risk
+    "rs7412",      # APOE ε2 defining SNP - protective variant
+    
+    # Secondary high-impact variants
+    "rs2075650",   # TOMM40 gene - 2-4x higher AD risk, linked to APOE
+    "rs199768005", # APOE rare variant - pathogenic significance
+    "rs6857",      # NECTIN2 gene - age-at-onset modifier
+    
+    # Alternative specification by genomic coordinates (GRCh38)
+    # Useful if rsIDs are not available in VCF
+    ("19", 44908684, "C"),   # rs429358 - APOE ε4 (C=risk allele)
+    ("19", 44908822, "T"),   # rs7412 - APOE ε2 (T=protective allele)  
+    ("19", 44892362, "G"),   # rs2075650 - TOMM40 (G=risk allele)
+    ("19", 44909057, "A"),   # rs199768005 - APOE rare variant
+    ("19", 44888997, "A"),   # rs6857 - NECTIN2 variant
 ]
 
-def encode_vcf(vcf_file_path: str, protocol_config: Dict[str, Any]) -> List[int]:
-    """Encode VCF genomic data to integer vectors suitable for FHE."""
-    validate_vcf_format(vcf_file_path)
-    
-    # Build variant lookup
-    variant_positions = {f"{v['chr']}:{v['pos']}:{v['ref']}:{v['alt']}": i for i, v in enumerate(TARGET_VARIANTS)}
-    
-    # Open file
-    file_handle = gzip.open(vcf_file_path, 'rt') if vcf_file_path.endswith('.gz') else open(vcf_file_path, 'r')
-    
-    try:
-        sample_names = []
-        encoded_data = []
-        
-        for line in file_handle:
-            line = line.strip()
-            if line.startswith('##'):
-                continue
-                
-            if line.startswith('#CHROM'):
-                sample_names = line.split('\t')[9:]
-                encoded_data = [[0 for _ in sample_names] for _ in range(len(TARGET_VARIANTS))]
-                continue
-                
-            if not line.startswith('#'):
-                fields = line.split('\t')
-                if len(fields) < 9:
-                    continue
-                    
-                variant_key = f"{fields[0]}:{fields[1]}:{fields[3]}:{fields[4]}"
-                if variant_key in variant_positions:
-                    variant_idx = variant_positions[variant_key]
-                    for sample_idx, genotype_data in enumerate(fields[9:]):
-                        if sample_idx >= len(sample_names):
-                            break
-                        gt_field = genotype_data.split(':')[0]
-                        encoded_data[variant_idx][sample_idx] = _encode_genotype(gt_field)
-                        
-    finally:
-        file_handle.close()
-    
-    # Flatten matrix
-    return [val for variant_data in encoded_data for val in variant_data]
+def make_record_map(vcf_path):
+    """Create mapping from variant identifiers to genotype values."""
+    record_map = {}
+    vcf_reader = pysam.VariantFile(vcf_path)
+    for record in vcf_reader.fetch():
+        # Get genotype value (0=ref/ref, 1=ref/alt, 2=alt/alt)
+        # Handle missing genotypes gracefully
+        try:
+            gt = record.samples[0]['GT']
+            if None in gt:
+                alt_count = 0  # Treat missing as reference
+            else:
+                alt_count = sum(gt)
+        except (KeyError, IndexError):
+            alt_count = 0
+            
+        # Map by rsID if available
+        if record.id and record.id != '.':
+            record_map[record.id] = alt_count
+            
+        # Map by chromosomal coordinates
+        if record.alts:
+            key = (str(record.chrom), record.pos, record.alts[0])
+            record_map[key] = alt_count
+            
+    return record_map
 
-def validate_vcf_format(vcf_file_path: str) -> None:
-    """Validate VCF file format and required fields."""
-    if not Path(vcf_file_path).exists():
-        raise FileNotFoundError(f"VCF file not found: {vcf_file_path}")
-    
-    file_handle = gzip.open(vcf_file_path, 'rt') if vcf_file_path.endswith('.gz') else open(vcf_file_path, 'r')
-    
-    try:
-        found_header = False
-        for i, line in enumerate(file_handle):
-            if i > 100:  # Check first 100 lines
-                break
-            if line.startswith('#CHROM'):
-                found_header = True
-                break
-        if not found_header:
-            raise ValueError("Invalid VCF format: missing header")
-    finally:
-        file_handle.close()
+def encode_on_variant_list(record_map: dict, filter_list: list):
+    """Encode specific variants from the target list."""
+    for pos_or_id in filter_list:
+        if isinstance(pos_or_id, tuple):
+            # Genomic coordinate specification
+            key = (str(pos_or_id[0]), pos_or_id[1], pos_or_id[2])
+        elif isinstance(pos_or_id, str):
+            # rsID specification
+            key = pos_or_id
+        else:
+            raise ValueError(f"Invalid variant specification: {pos_or_id}")
+            
+        # Return genotype count (0, 1, or 2) or 0 if variant not found
+        yield record_map.get(key, 0)
 
-def _encode_genotype(genotype: str) -> int:
-    """Encode genotype to integer: 0=0/0, 1=0/1, 2=1/1, -1=missing."""
-    if genotype in ['./.', '.', '.|.']:
-        return -1
+def encode_vcf(vcf_path: str) -> List[int]:
+    """
+    Encode VCF genomic data to integer vectors suitable for FHE.
     
-    alleles = genotype.replace('|', '/').split('/')
-    try:
-        return sum(int(a) for a in alleles if a != '.')
-    except ValueError:
-        return -1 
+    Returns list of integers representing genotype counts for each target variant:
+    - 0: homozygous reference (no risk alleles)
+    - 1: heterozygous (one risk allele) 
+    - 2: homozygous alternate (two risk alleles)
+    
+    For privacy-sensitive allele frequency analysis of Alzheimer's disease variants.
+    """
+    record_map = make_record_map(vcf_path)
+    encoded_data = list(encode_on_variant_list(record_map, TARGET_VARIANTS))
+    return encoded_data

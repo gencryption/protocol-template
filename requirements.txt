@@ -4,3 +4,4 @@
 
 # Data processing
 pyyaml>=6.0 
+tenseal>=0.3.0
